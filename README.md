@@ -4,14 +4,15 @@ A Python script that removes stale entries from VS Code's **Open Recent** list �
 
 ## Background
 
-VS Code 1.122+ stores "Open Recent" data in two separate locations:
+VS Code 1.122+ stores "Open Recent" data in three separate locations:
 
 | Type | Storage Location | Key |
 |------|-----------------|-----|
-| Folders / workspaces | `%APPDATA%\Code\User\globalStorage\storage.json` | `profileAssociations.workspaces` |
-| Individual files | `%APPDATA%\Code\User\workspaceStorage\*/state.vscdb` | `history.entries` |
+| All recently opened (folders + files) | `~/.vscode-shared/sharedStorage/state.vscdb` | `history.recentlyOpenedPathsList` |
+| Folder/workspace profile associations | `%APPDATA%\Code\User\globalStorage\storage.json` | `profileAssociations.workspaces` |
+| Per-workspace editor tab history | `%APPDATA%\Code\User\workspaceStorage\*/state.vscdb` | `history.entries` |
 
-Older tutorials that edit `state.vscdb` → `history.recentlyOpenedPathsList` no longer work because that key was removed in newer VS Code versions.
+The global recently opened list (`~/.vscode-shared/`) is what populates the **File → Open Recent** menu. Older tutorials that look for `history.recentlyOpenedPathsList` in `%APPDATA%\Code\User\globalStorage\state.vscdb` no longer work — that key moved to the shared storage location.
 
 ## Requirements
 
