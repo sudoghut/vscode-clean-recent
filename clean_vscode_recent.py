@@ -2,9 +2,13 @@
 clean_vscode_recent.py
 Removes stale entries from VS Code's "Open Recent" list.
 
-Covers two storage locations used by VS Code 1.122+:
-  1. Workspace/folder history  -> storage.json (profileAssociations.workspaces)
-  2. File editor history        -> workspaceStorage/*/state.vscdb (history.entries)
+Covers three storage locations used by VS Code 1.122+:
+  1. Global recently opened list (folders + files)
+       -> ~/.vscode-shared/sharedStorage/state.vscdb (history.recentlyOpenedPathsList)
+  2. Workspace/folder profile associations
+       -> %APPDATA%/Code/User/globalStorage/storage.json (profileAssociations.workspaces)
+  3. Per-workspace file editor history
+       -> %APPDATA%/Code/User/workspaceStorage/*/state.vscdb (history.entries)
 
 Remote and WSL URIs are never touched.
 VS Code must be closed before running this script.
@@ -43,7 +47,125 @@ def uri_to_local_path(uri: str):
 
 
 # ---------------------------------------------------------------------------
-# Part 1: workspace/folder history  (storage.json)
+# Part 1: global recently opened list  (~/.vscode-shared/sharedStorage/state.vscdb)
+# ---------------------------------------------------------------------------
+
+def clean_global_recently_opened():
+    db_path = os.path.join(
+        os.path.expanduser("~"), ".vscode-shared", "sharedStorage", "state.vscdb"
+    )
+    if not os.path.exists(db_path):
+        print("[global] ~/.vscode-shared/sharedStorage/state.vscdb not found, skipping.")
+        return
+
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT value FROM ItemTable WHERE key='history.recentlyOpenedPathsList'"
+        )
+        row = cur.fetchone()
+    except sqlite3.Error as e:
+        print(f"[global] SQLite error: {e}")
+        return
+
+    if not row:
+        print("[global] history.recentlyOpenedPathsList key not found.")
+        conn.close()
+        return
+
+    try:
+        data = json.loads(row[0])
+    except json.JSONDecodeError as e:
+        print(f"[global] JSON parse error: {e}")
+        conn.close()
+        return
+
+    entries = data.get("entries", [])
+    print(f"[global] Found {len(entries)} entries.")
+
+    kept = []
+    removed = []
+    for entry in entries:
+        folder_uri = entry.get("folderUri")
+        file_uri   = entry.get("fileUri")
+        workspace  = entry.get("workspace")
+
+        if folder_uri:
+            path = uri_to_local_path(folder_uri)
+        elif file_uri:
+            path = uri_to_local_path(file_uri)
+        elif workspace:
+            config = workspace.get("configPath") if isinstance(workspace, dict) else workspace
+            path = uri_to_local_path(config)
+        else:
+            kept.append(entry)
+            continue
+
+        if path is None or os.path.exists(path):
+            kept.append(entry)
+        else:
+            removed.append(entry)
+
+    if not removed:
+        print("[global] Nothing to remove.")
+        conn.close()
+        return
+
+    print(f"[global] Removing {len(removed)} stale entries:")
+    for entry in removed:
+        uri = entry.get("folderUri") or entry.get("fileUri") or str(entry.get("workspace", ""))
+        print(f"  - {unquote(str(uri))}")
+
+    # Backup before modifying
+    backup = db_path + ".bak"
+    shutil.copy2(db_path, backup)
+    print(f"[global] Backup saved to {backup}")
+
+    # Atomic write: recreate database with updated entries
+    data["entries"] = kept
+    db_dir = os.path.dirname(db_path)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=db_dir, delete=False, suffix=".tmp"
+        ) as tmp:
+            tmp_path = tmp.name
+
+        conn2 = sqlite3.connect(tmp_path)
+        cur2 = conn2.cursor()
+        cur2.execute(
+            "CREATE TABLE ItemTable "
+            "(key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)"
+        )
+        # Write updated recently opened list
+        cur2.execute(
+            "INSERT INTO ItemTable VALUES ('history.recentlyOpenedPathsList', ?)",
+            (json.dumps(data),),
+        )
+        # Copy all other keys unchanged
+        cur.execute(
+            "SELECT key, value FROM ItemTable "
+            "WHERE key != 'history.recentlyOpenedPathsList'"
+        )
+        for k, v in cur.fetchall():
+            cur2.execute("INSERT INTO ItemTable VALUES (?, ?)", (k, v))
+        conn2.commit()
+        conn2.close()
+        conn.close()
+        os.replace(tmp_path, db_path)
+    except (sqlite3.Error, OSError) as e:
+        print(f"[global] Failed to write database: {e}")
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        conn.close()
+        return
+
+    print(f"[global] Done. Kept {len(kept)}, removed {len(removed)}.")
+
+
+# ---------------------------------------------------------------------------
+# Part 2: workspace/folder profile associations  (storage.json)
 # ---------------------------------------------------------------------------
 
 def clean_workspace_history():
@@ -81,14 +203,13 @@ def clean_workspace_history():
     for uri in removed:
         print(f"  - {unquote(uri)}")
 
-    # Back up before modifying
     backup = storage_path + ".bak"
     shutil.copy2(storage_path, backup)
     print(f"[workspace] Backup saved to {backup}")
 
-    # Atomic write: write to a temp file in the same directory, then replace
     data["profileAssociations"]["workspaces"] = kept
     storage_dir = os.path.dirname(storage_path)
+    tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(
             mode="w", encoding="utf-8", dir=storage_dir,
@@ -99,7 +220,7 @@ def clean_workspace_history():
         os.replace(tmp_path, storage_path)
     except OSError as e:
         print(f"[workspace] Failed to write storage.json: {e}")
-        if os.path.exists(tmp_path):
+        if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
         return
 
@@ -107,7 +228,7 @@ def clean_workspace_history():
 
 
 # ---------------------------------------------------------------------------
-# Part 2: per-workspace file editor history  (workspaceStorage/*/state.vscdb)
+# Part 3: per-workspace file editor history  (workspaceStorage/*/state.vscdb)
 # ---------------------------------------------------------------------------
 
 def clean_file_history():
@@ -178,6 +299,8 @@ def clean_file_history():
 if __name__ == "__main__":
     print("VS Code Recent Cleaner")
     print("Make sure VS Code is closed before proceeding.\n")
+    clean_global_recently_opened()
+    print()
     clean_workspace_history()
     clean_file_history()
     print("\nAll done. Restart VS Code to see the changes.")
